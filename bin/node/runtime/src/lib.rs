@@ -39,6 +39,7 @@ use sp_core::{
 	crypto::KeyTypeId,
 	u32_trait::{_1, _2, _3, _4},
 	OpaqueMetadata,
+	ed25519::Public as NodePublicKey,
 };
 pub use node_primitives::{AccountId, Signature};
 use node_primitives::{AccountIndex, Balance, BlockNumber, Hash, Index, Moment};
@@ -206,6 +207,21 @@ impl pallet_multisig::Trait for Runtime {
 	type DepositBase = DepositBase;
 	type DepositFactor = DepositFactor;
 	type MaxSignatories = MaxSignatories;
+	type WeightInfo = ();
+}
+
+parameter_types! {
+	pub const MaxAuthorizedNodes: u32 = 8;
+}
+
+impl pallet_node_authorization::Trait for Runtime {
+	type Event = Event;
+	type MaxAuthorizedNodes = MaxAuthorizedNodes;
+	type NodeId = NodePublicKey;
+	type AddOrigin = EnsureRootOrHalfCouncil;
+	type RemoveOrigin = EnsureRootOrHalfCouncil;
+	type SwapOrigin = EnsureRootOrHalfCouncil;
+	type ResetOrigin = EnsureRootOrHalfCouncil;
 	type WeightInfo = ();
 }
 
@@ -879,6 +895,7 @@ construct_runtime!(
 		Scheduler: pallet_scheduler::{Module, Call, Storage, Event<T>},
 		Proxy: pallet_proxy::{Module, Call, Storage, Event<T>},
 		Multisig: pallet_multisig::{Module, Call, Storage, Event<T>},
+		NodeAuthorization: pallet_node_authorization::{Module, Call, Storage, Event<T>, Config<T>},
 	}
 );
 
