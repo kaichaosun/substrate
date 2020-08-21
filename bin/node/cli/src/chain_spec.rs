@@ -19,13 +19,13 @@
 //! Substrate chain configurations.
 
 use sc_chain_spec::ChainSpecExtension;
-use sp_core::{Pair, Public, crypto::UncheckedInto, sr25519};
+use sp_core::{Pair, Public, crypto::UncheckedInto, sr25519, ed25519, NodePublicKey};
 use serde::{Serialize, Deserialize};
 use node_runtime::{
 	AuthorityDiscoveryConfig, BabeConfig, BalancesConfig, ContractsConfig, CouncilConfig,
 	DemocracyConfig,GrandpaConfig, ImOnlineConfig, SessionConfig, SessionKeys, StakerStatus,
 	StakingConfig, ElectionsConfig, IndicesConfig, SocietyConfig, SudoConfig, SystemConfig,
-	TechnicalCommitteeConfig, wasm_binary_unwrap,
+	TechnicalCommitteeConfig, NodeAuthorizationConfig, wasm_binary_unwrap,
 };
 use node_runtime::Block;
 use node_runtime::constants::currency::*;
@@ -321,6 +321,12 @@ pub fn testnet_genesis(
 			max_members: 999,
 		}),
 		pallet_vesting: Some(Default::default()),
+		pallet_node_authorization: Some(NodeAuthorizationConfig {
+			nodes: vec![
+				NodePublicKey::Ed25519(ed25519::Public::from_raw(hex!("1ce5f00ef6e89374afb625f1ae4c1546d31234e87e3c3f51a62b91dd6bfa57df"))),
+				NodePublicKey::Ed25519(ed25519::Public::from_raw(hex!("dacde7714d8551f674b8bb4b54239383c76a2b286fa436e93b2b7eb226bf4de7"))),
+			],
+		}),
 	}
 }
 

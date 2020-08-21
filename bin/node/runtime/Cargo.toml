@@ -61,6 +61,7 @@ pallet-indices = { version = "2.0.0-rc6", default-features = false, path = "../.
 pallet-identity = { version = "2.0.0-rc6", default-features = false, path = "../../../frame/identity" }
 pallet-membership = { version = "2.0.0-rc6", default-features = false, path = "../../../frame/membership" }
 pallet-multisig = { version = "2.0.0-rc6", default-features = false, path = "../../../frame/multisig" }
+pallet-node-authorization = { version = "2.0.0-rc6", default-features = false, path = "../../../frame/node-authorization" }
 pallet-offences = { version = "2.0.0-rc6", default-features = false, path = "../../../frame/offences" }
 pallet-offences-benchmarking = { version = "2.0.0-rc6", path = "../../../frame/offences/benchmarking", default-features = false, optional = true }
 pallet-proxy = { version = "2.0.0-rc6", default-features = false, path = "../../../frame/proxy" }
@@ -111,6 +112,7 @@ std = [
 	"sp-inherents/std",
 	"pallet-membership/std",
 	"pallet-multisig/std",
+	"pallet-node-authorization/std",
 	"pallet-identity/std",
 	"pallet-scheduler/std",
 	"node-primitives/std",

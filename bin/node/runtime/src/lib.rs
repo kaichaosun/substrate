@@ -211,6 +211,20 @@ impl pallet_multisig::Trait for Runtime {
 }
 
 parameter_types! {
+	pub const MaxAuthorizedNodes: u32 = 8;
+}
+
+impl pallet_node_authorization::Trait for Runtime {
+	type Event = Event;
+	type MaxAuthorizedNodes = MaxAuthorizedNodes;
+	type AddOrigin = EnsureRootOrHalfCouncil;
+	type RemoveOrigin = EnsureRootOrHalfCouncil;
+	type SwapOrigin = EnsureRootOrHalfCouncil;
+	type ResetOrigin = EnsureRootOrHalfCouncil;
+	type WeightInfo = ();
+}
+
+parameter_types! {
 	// One storage item; key size 32, value size 8; .
 	pub const ProxyDepositBase: Balance = deposit(1, 8);
 	// Additional storage item size of 33 bytes.
@@ -884,6 +898,7 @@ construct_runtime!(
 		Scheduler: pallet_scheduler::{Module, Call, Storage, Event<T>},
 		Proxy: pallet_proxy::{Module, Call, Storage, Event<T>},
 		Multisig: pallet_multisig::{Module, Call, Storage, Event<T>},
+		NodeAuthorization: pallet_node_authorization::{Module, Call, Storage, Event, Config},
 	}
 );
 
