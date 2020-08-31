@@ -853,6 +853,20 @@ impl pallet_vesting::Trait for Runtime {
 	type WeightInfo = ();
 }
 
+parameter_types! {
+	pub const MaxWellKnownNodes: u32 = 8;
+}
+
+impl pallet_node_authorization::Trait for Runtime {
+	type Event = Event;
+	type MaxWellKnownNodes = MaxWellKnownNodes;
+	type AddOrigin = EnsureRootOrHalfCouncil;
+	type RemoveOrigin = EnsureRootOrHalfCouncil;
+	type SwapOrigin = EnsureRootOrHalfCouncil;
+	type ResetOrigin = EnsureRootOrHalfCouncil;
+	type WeightInfo = ();
+}
+
 construct_runtime!(
 	pub enum Runtime where
 		Block = Block,
@@ -891,6 +905,7 @@ construct_runtime!(
 		Scheduler: pallet_scheduler::{Module, Call, Storage, Event<T>},
 		Proxy: pallet_proxy::{Module, Call, Storage, Event<T>},
 		Multisig: pallet_multisig::{Module, Call, Storage, Event<T>},
+		NodeAuthorization: pallet_node_authorization::{Module, Call, Storage, Event<T>, Config<T>},
 	}
 );
 
