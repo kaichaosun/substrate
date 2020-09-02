@@ -45,6 +45,7 @@ rand = "0.7.2"
 structopt = { version = "0.3.8", optional = true }
 tracing = "0.1.18"
 parking_lot = "0.10.0"
+bs58 = "0.3.1"
 
 # primitives
 sp-authority-discovery = { version = "2.0.0-rc6",  path = "../../../primitives/authority-discovery" }
@@ -89,6 +90,7 @@ pallet-im-online = { version = "2.0.0-rc6", default-features = false, path = "..
 pallet-authority-discovery = { version = "2.0.0-rc6", path = "../../../frame/authority-discovery" }
 pallet-staking = { version = "2.0.0-rc6", path = "../../../frame/staking" }
 pallet-grandpa = { version = "2.0.0-rc6", path = "../../../frame/grandpa" }
+pallet-node-authorization = { version = "2.0.0-rc6", path = "../../../frame/node-authorization" }
 
 # node-specific dependencies
 node-runtime = { version = "2.0.0-rc6", path = "../runtime" }

@@ -3717,6 +3717,7 @@ name = "node-cli"
 version = "2.0.0-rc6"
 dependencies = [
  "assert_cmd",
+ "bs58",
  "frame-benchmarking-cli",
  "frame-support",
  "frame-system",
@@ -3737,6 +3738,7 @@ dependencies = [
  "pallet-grandpa",
  "pallet-im-online",
  "pallet-indices",
+ "pallet-node-authorization",
  "pallet-staking",
  "pallet-timestamp",
  "pallet-transaction-payment",
@@ -3923,6 +3925,7 @@ dependencies = [
  "pallet-indices",
  "pallet-membership",
  "pallet-multisig",
+ "pallet-node-authorization",
  "pallet-offences",
  "pallet-offences-benchmarking",
  "pallet-proxy",
