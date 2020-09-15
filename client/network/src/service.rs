@@ -111,494 +111,6 @@ pub struct NetworkService<B: BlockT + 'static, H: ExHashT> {
 	_marker: PhantomData<H>,
 }
 
-impl<B: BlockT + 'static, H: ExHashT> NetworkWorker<B, H> {
-	/// Creates the network service.
-	///
-	/// Returns a `NetworkWorker` that implements `Future` and must be regularly polled in order
-	/// for the network processing to advance. From it, you can extract a `NetworkService` using
-	/// `worker.service()`. The `NetworkService` can be shared through the codebase.
-	pub fn new(params: Params<B, H>) -> Result<NetworkWorker<B, H>, Error> {
-		// Ensure the listen addresses are consistent with the transport.
-		ensure_addresses_consistent_with_transport(
-			params.network_config.listen_addresses.iter(),
-			&params.network_config.transport,
-		)?;
-		ensure_addresses_consistent_with_transport(
-			params.network_config.boot_nodes.iter().map(|x| &x.multiaddr),
-			&params.network_config.transport,
-		)?;
-		ensure_addresses_consistent_with_transport(
-			params.network_config.reserved_nodes.iter().map(|x| &x.multiaddr),
-			&params.network_config.transport,
-		)?;
-		ensure_addresses_consistent_with_transport(
-			params.network_config.public_addresses.iter(),
-			&params.network_config.transport,
-		)?;
-
-		let (to_worker, from_service) = tracing_unbounded("mpsc_network_worker");
-
-		if let Some(path) = params.network_config.net_config_path {
-			fs::create_dir_all(&path)?;
-		}
-
-		// List of multiaddresses that we know in the network.
-		let mut known_addresses = Vec::new();
-		let mut bootnodes = Vec::new();
-		let mut boot_node_ids = HashSet::new();
-
-		// Process the bootnodes.
-		for bootnode in params.network_config.boot_nodes.iter() {
-			bootnodes.push(bootnode.peer_id.clone());
-			boot_node_ids.insert(bootnode.peer_id.clone());
-			known_addresses.push((bootnode.peer_id.clone(), bootnode.multiaddr.clone()));
-		}
-
-		let boot_node_ids = Arc::new(boot_node_ids);
-
-		// Check for duplicate bootnodes.
-		known_addresses.iter()
-			.try_for_each(|(peer_id, addr)|
-				if let Some(other) = known_addresses
-					.iter()
-					.find(|o| o.1 == *addr && o.0 != *peer_id)
-				{
-					Err(Error::DuplicateBootnode {
-						address: addr.clone(),
-						first_id: peer_id.clone(),
-						second_id: other.0.clone(),
-					})
-				} else {
-					Ok(())
-				}
-			)?;
-
-		// Initialize the peers we should always be connected to.
-		let priority_groups = {
-			let mut reserved_nodes = HashSet::new();
-			for reserved in params.network_config.reserved_nodes.iter() {
-				reserved_nodes.insert(reserved.peer_id.clone());
-				known_addresses.push((reserved.peer_id.clone(), reserved.multiaddr.clone()));
-			}
-
-			let print_deprecated_message = match &params.role {
-				Role::Sentry { .. } => true,
-				Role::Authority { sentry_nodes } if !sentry_nodes.is_empty() => true,
-				_ => false,
-			};
-			if print_deprecated_message {
-				log::warn!(
-					"🙇 Sentry nodes are deprecated, and the `--sentry` and  `--sentry-nodes` \
-					CLI options will eventually be removed in a future version. The Substrate \
-					and Polkadot networking protocol require validators to be \
-					publicly-accessible. Please do not block access to your validator nodes. \
-					For details, see https://github.com/paritytech/substrate/issues/6845."
-				);
-			}
-
-			let mut sentries_and_validators = HashSet::new();
-			match &params.role {
-				Role::Sentry { validators } => {
-					for validator in validators {
-						sentries_and_validators.insert(validator.peer_id.clone());
-						reserved_nodes.insert(validator.peer_id.clone());
-						known_addresses.push((validator.peer_id.clone(), validator.multiaddr.clone()));
-					}
-				}
-				Role::Authority { sentry_nodes } => {
-					for sentry_node in sentry_nodes {
-						sentries_and_validators.insert(sentry_node.peer_id.clone());
-						reserved_nodes.insert(sentry_node.peer_id.clone());
-						known_addresses.push((sentry_node.peer_id.clone(), sentry_node.multiaddr.clone()));
-					}
-				}
-				_ => {}
-			}
-
-			vec![
-				("reserved".to_owned(), reserved_nodes),
-				("sentries_and_validators".to_owned(), sentries_and_validators),
-			]
-		};
-
-		let peerset_config = sc_peerset::PeersetConfig {
-			in_peers: params.network_config.in_peers,
-			out_peers: params.network_config.out_peers,
-			bootnodes,
-			reserved_only: params.network_config.non_reserved_mode == NonReservedPeerMode::Deny,
-			priority_groups,
-		};
-
-		// Private and public keys configuration.
-		let local_identity = params.network_config.node_key.clone().into_keypair()?;
-		let local_public = local_identity.public();
-		let local_peer_id = local_public.clone().into_peer_id();
-		let local_peer_id_legacy = bs58::encode(Borrow::<[u8]>::borrow(&local_peer_id)).into_string();
-		info!(
-			target: "sub-libp2p",
-			"🏷  Local node identity is: {} (legacy representation: {})",
-			local_peer_id.to_base58(),
-			local_peer_id_legacy
-		);
-
-		let checker = params.on_demand.as_ref()
-			.map(|od| od.checker().clone())
-			.unwrap_or_else(|| Arc::new(AlwaysBadChecker));
-
-		let num_connected = Arc::new(AtomicUsize::new(0));
-		let is_major_syncing = Arc::new(AtomicBool::new(false));
-		let (protocol, peerset_handle) = Protocol::new(
-			protocol::ProtocolConfig {
-				roles: From::from(&params.role),
-				max_parallel_downloads: params.network_config.max_parallel_downloads,
-			},
-			local_peer_id.clone(),
-			params.chain.clone(),
-			params.transaction_pool,
-			params.finality_proof_request_builder,
-			params.protocol_id.clone(),
-			peerset_config,
-			params.block_announce_validator,
-			params.metrics_registry.as_ref(),
-			boot_node_ids.clone(),
-		)?;
-
-		// Build the swarm.
-		let (mut swarm, bandwidth): (Swarm<B, H>, _) = {
-			let user_agent = format!(
-				"{} ({})",
-				params.network_config.client_version,
-				params.network_config.node_name
-			);
-			let block_requests = {
-				let config = block_requests::Config::new(&params.protocol_id);
-				block_requests::BlockRequests::new(config, params.chain.clone())
-			};
-			let finality_proof_requests = {
-				let config = finality_requests::Config::new(&params.protocol_id);
-				finality_requests::FinalityProofRequests::new(config, params.finality_proof_provider.clone())
-			};
-			let light_client_handler = {
-				let config = light_client_handler::Config::new(&params.protocol_id);
-				light_client_handler::LightClientHandler::new(
-					config,
-					params.chain,
-					checker,
-					peerset_handle.clone(),
-				)
-			};
-
-			let discovery_config = {
-				let mut config = DiscoveryConfig::new(local_public.clone());
-				config.with_user_defined(known_addresses);
-				config.discovery_limit(u64::from(params.network_config.out_peers) + 15);
-				config.add_protocol(params.protocol_id.clone());
-				config.allow_non_globals_in_dht(params.network_config.allow_non_globals_in_dht);
-
-				match params.network_config.transport {
-					TransportConfig::MemoryOnly => {
-						config.with_mdns(false);
-						config.allow_private_ipv4(false);
-					}
-					TransportConfig::Normal { enable_mdns, allow_private_ipv4, .. } => {
-						config.with_mdns(enable_mdns);
-						config.allow_private_ipv4(allow_private_ipv4);
-					}
-				}
-
-				config
-			};
-
-			let mut behaviour = {
-				let result = Behaviour::new(
-					protocol,
-					params.role,
-					user_agent,
-					local_public,
-					block_requests,
-					finality_proof_requests,
-					light_client_handler,
-					discovery_config,
-					params.network_config.request_response_protocols,
-				);
-
-				match result {
-					Ok(b) => b,
-					Err(crate::request_responses::RegisterError::DuplicateProtocol(proto)) => {
-						return Err(Error::DuplicateRequestResponseProtocol {
-							protocol: proto,
-						})
-					},
-				}
-			};
-
-			for (engine_id, protocol_name) in &params.network_config.notifications_protocols {
-				behaviour.register_notifications_protocol(*engine_id, protocol_name.clone());
-			}
-			let (transport, bandwidth) = {
-				let (config_mem, config_wasm, flowctrl) = match params.network_config.transport {
-					TransportConfig::MemoryOnly => (true, None, false),
-					TransportConfig::Normal { wasm_external_transport, use_yamux_flow_control, .. } =>
-						(false, wasm_external_transport, use_yamux_flow_control)
-				};
-				transport::build_transport(local_identity, config_mem, config_wasm, flowctrl)
-			};
-			let mut builder = SwarmBuilder::new(transport, behaviour, local_peer_id.clone())
-				.peer_connection_limit(crate::MAX_CONNECTIONS_PER_PEER)
-				.notify_handler_buffer_size(NonZeroUsize::new(32).expect("32 != 0; qed"))
-				.connection_event_buffer_size(1024);
-			if let Some(spawner) = params.executor {
-				struct SpawnImpl<F>(F);
-				impl<F: Fn(Pin<Box<dyn Future<Output = ()> + Send>>)> Executor for SpawnImpl<F> {
-					fn exec(&self, f: Pin<Box<dyn Future<Output = ()> + Send>>) {
-						(self.0)(f)
-					}
-				}
-				builder = builder.executor(Box::new(SpawnImpl(spawner)));
-			}
-			(builder.build(), bandwidth)
-		};
-
-		// Initialize the metrics.
-		let metrics = match &params.metrics_registry {
-			Some(registry) => {
-				Some(metrics::register(registry, MetricSources {
-					bandwidth: bandwidth.clone(),
-					major_syncing: is_major_syncing.clone(),
-					connected_peers: num_connected.clone(),
-				})?)
-			}
-			None => None
-		};
-
-		// Listen on multiaddresses.
-		for addr in &params.network_config.listen_addresses {
-			if let Err(err) = Swarm::<B, H>::listen_on(&mut swarm, addr.clone()) {
-				warn!(target: "sub-libp2p", "Can't listen on {} because: {:?}", addr, err)
-			}
-		}
-
-		// Add external addresses.
-		for addr in &params.network_config.public_addresses {
-			Swarm::<B, H>::add_external_address(&mut swarm, addr.clone());
-		}
-
-		let external_addresses = Arc::new(Mutex::new(Vec::new()));
-		let peers_notifications_sinks = Arc::new(Mutex::new(HashMap::new()));
-		let protocol_name_by_engine = Mutex::new({
-			params.network_config.notifications_protocols.iter().cloned().collect()
-		});
-
-		let service = Arc::new(NetworkService {
-			bandwidth,
-			external_addresses: external_addresses.clone(),
-			num_connected: num_connected.clone(),
-			is_major_syncing: is_major_syncing.clone(),
-			peerset: peerset_handle,
-			local_peer_id,
-			to_worker,
-			peers_notifications_sinks: peers_notifications_sinks.clone(),
-			protocol_name_by_engine,
-			notifications_sizes_metric:
-				metrics.as_ref().map(|metrics| metrics.notifications_sizes.clone()),
-			_marker: PhantomData,
-		});
-
-		Ok(NetworkWorker {
-			external_addresses,
-			num_connected,
-			is_major_syncing,
-			network_service: swarm,
-			service,
-			import_queue: params.import_queue,
-			from_service,
-			light_client_rqs: params.on_demand.and_then(|od| od.extract_receiver()),
-			event_streams: out_events::OutChannels::new(params.metrics_registry.as_ref())?,
-			peers_notifications_sinks,
-			metrics,
-			boot_node_ids,
-			pending_requests: HashMap::with_capacity(128),
-		})
-	}
-
-	/// High-level network status information.
-	pub fn status(&self) -> NetworkStatus<B> {
-		NetworkStatus {
-			sync_state: self.sync_state(),
-			best_seen_block: self.best_seen_block(),
-			num_sync_peers: self.num_sync_peers(),
-			num_connected_peers: self.num_connected_peers(),
-			num_active_peers: self.num_active_peers(),
-			total_bytes_inbound: self.total_bytes_inbound(),
-			total_bytes_outbound: self.total_bytes_outbound(),
-		}
-	}
-
-	/// Returns the total number of bytes received so far.
-	pub fn total_bytes_inbound(&self) -> u64 {
-		self.service.bandwidth.total_inbound()
-	}
-
-	/// Returns the total number of bytes sent so far.
-	pub fn total_bytes_outbound(&self) -> u64 {
-		self.service.bandwidth.total_outbound()
-	}
-
-	/// Returns the number of peers we're connected to.
-	pub fn num_connected_peers(&self) -> usize {
-		self.network_service.user_protocol().num_connected_peers()
-	}
-
-	/// Returns the number of peers we're connected to and that are being queried.
-	pub fn num_active_peers(&self) -> usize {
-		self.network_service.user_protocol().num_active_peers()
-	}
-
-	/// Current global sync state.
-	pub fn sync_state(&self) -> SyncState {
-		self.network_service.user_protocol().sync_state()
-	}
-
-	/// Target sync block number.
-	pub fn best_seen_block(&self) -> Option<NumberFor<B>> {
-		self.network_service.user_protocol().best_seen_block()
-	}
-
-	/// Number of peers participating in syncing.
-	pub fn num_sync_peers(&self) -> u32 {
-		self.network_service.user_protocol().num_sync_peers()
-	}
-
-	/// Number of blocks in the import queue.
-	pub fn num_queued_blocks(&self) -> u32 {
-		self.network_service.user_protocol().num_queued_blocks()
-	}
-
-	/// Returns the number of downloaded blocks.
-	pub fn num_downloaded_blocks(&self) -> usize {
-		self.network_service.user_protocol().num_downloaded_blocks()
-	}
-
-	/// Number of active sync requests.
-	pub fn num_sync_requests(&self) -> usize {
-		self.network_service.user_protocol().num_sync_requests()
-	}
-
-	/// Adds an address for a node.
-	pub fn add_known_address(&mut self, peer_id: PeerId, addr: Multiaddr) {
-		self.network_service.add_known_address(peer_id, addr);
-	}
-
-	/// Return a `NetworkService` that can be shared through the code base and can be used to
-	/// manipulate the worker.
-	pub fn service(&self) -> &Arc<NetworkService<B, H>> {
-		&self.service
-	}
-
-	/// You must call this when a new block is finalized by the client.
-	pub fn on_block_finalized(&mut self, hash: B::Hash, header: B::Header) {
-		self.network_service.user_protocol_mut().on_block_finalized(hash, &header);
-	}
-
-	/// This should be called when blocks are added to the
-	/// chain by something other than the import queue.
-	/// Currently this is only useful for tests.
-	pub fn update_chain(&mut self) {
-		self.network_service.user_protocol_mut().update_chain();
-	}
-
-	/// Returns the local `PeerId`.
-	pub fn local_peer_id(&self) -> &PeerId {
-		Swarm::<B, H>::local_peer_id(&self.network_service)
-	}
-
-	/// Returns the list of addresses we are listening on.
-	///
-	/// Does **NOT** include a trailing `/p2p/` with our `PeerId`.
-	pub fn listen_addresses(&self) -> impl Iterator<Item = &Multiaddr> {
-		Swarm::<B, H>::listeners(&self.network_service)
-	}
-
-	/// Get network state.
-	///
-	/// **Note**: Use this only for debugging. This API is unstable. There are warnings literally
-	/// everywhere about this. Please don't use this function to retrieve actual information.
-	pub fn network_state(&mut self) -> NetworkState {
-		let swarm = &mut self.network_service;
-		let open = swarm.user_protocol().open_peers().cloned().collect::<Vec<_>>();
-
-		let connected_peers = {
-			let swarm = &mut *swarm;
-			open.iter().filter_map(move |peer_id| {
-				let known_addresses = NetworkBehaviour::addresses_of_peer(&mut **swarm, peer_id)
-					.into_iter().collect();
-
-				let endpoint = if let Some(e) = swarm.node(peer_id).map(|i| i.endpoint()) {
-					e.clone().into()
-				} else {
-					error!(target: "sub-libp2p", "Found state inconsistency between custom protocol \
-						and debug information about {:?}", peer_id);
-					return None
-				};
-
-				Some((peer_id.to_base58(), NetworkStatePeer {
-					endpoint,
-					version_string: swarm.node(peer_id)
-						.and_then(|i| i.client_version().map(|s| s.to_owned())),
-					latest_ping_time: swarm.node(peer_id).and_then(|i| i.latest_ping()),
-					enabled: swarm.user_protocol().is_enabled(&peer_id),
-					open: swarm.user_protocol().is_open(&peer_id),
-					known_addresses,
-				}))
-			}).collect()
-		};
-
-		let not_connected_peers = {
-			let swarm = &mut *swarm;
-			swarm.known_peers().into_iter()
-				.filter(|p| open.iter().all(|n| n != p))
-				.map(move |peer_id| {
-					(peer_id.to_base58(), NetworkStateNotConnectedPeer {
-						version_string: swarm.node(&peer_id)
-							.and_then(|i| i.client_version().map(|s| s.to_owned())),
-						latest_ping_time: swarm.node(&peer_id).and_then(|i| i.latest_ping()),
-						known_addresses: NetworkBehaviour::addresses_of_peer(&mut **swarm, &peer_id)
-							.into_iter().collect(),
-					})
-				})
-				.collect()
-		};
-
-		NetworkState {
-			peer_id: Swarm::<B, H>::local_peer_id(&swarm).to_base58(),
-			listened_addresses: Swarm::<B, H>::listeners(&swarm).cloned().collect(),
-			external_addresses: Swarm::<B, H>::external_addresses(&swarm).cloned().collect(),
-			connected_peers,
-			not_connected_peers,
-			peerset: swarm.user_protocol_mut().peerset_debug_info(),
-		}
-	}
-
-	/// Get currently connected peers.
-	pub fn peers_debug_info(&mut self) -> Vec<(PeerId, PeerInfo<B>)> {
-		self.network_service.user_protocol_mut()
-			.peers_info()
-			.map(|(id, info)| (id.clone(), info.clone()))
-			.collect()
-	}
-
-	/// Removes a `PeerId` from the list of reserved peers.
-	pub fn remove_reserved_peer(&self, peer: PeerId) {
-		self.service.remove_reserved_peer(peer);
-	}
-
-	/// Adds a `PeerId` and its address as reserved. The string should encode the address
-	/// and peer ID of the remote node.
-	pub fn add_reserved_peer(&self, peer: String) -> Result<(), String> {
-		self.service.add_reserved_peer(peer)
-	}
-}
-
 impl<B: BlockT + 'static, H: ExHashT> NetworkService<B, H> {
 	/// Returns the local `PeerId`.
 	pub fn local_peer_id(&self) -> &PeerId {
@@ -1198,6 +710,494 @@ pub struct NetworkWorker<B: BlockT + 'static, H: ExHashT> {
 	/// For each peer and protocol combination, an object that allows sending notifications to
 	/// that peer. Shared with the [`NetworkService`].
 	peers_notifications_sinks: Arc<Mutex<HashMap<(PeerId, ConsensusEngineId), NotificationsSink>>>,
+}
+
+impl<B: BlockT + 'static, H: ExHashT> NetworkWorker<B, H> {
+	/// Creates the network service.
+	///
+	/// Returns a `NetworkWorker` that implements `Future` and must be regularly polled in order
+	/// for the network processing to advance. From it, you can extract a `NetworkService` using
+	/// `worker.service()`. The `NetworkService` can be shared through the codebase.
+	pub fn new(params: Params<B, H>) -> Result<NetworkWorker<B, H>, Error> {
+		// Ensure the listen addresses are consistent with the transport.
+		ensure_addresses_consistent_with_transport(
+			params.network_config.listen_addresses.iter(),
+			&params.network_config.transport,
+		)?;
+		ensure_addresses_consistent_with_transport(
+			params.network_config.boot_nodes.iter().map(|x| &x.multiaddr),
+			&params.network_config.transport,
+		)?;
+		ensure_addresses_consistent_with_transport(
+			params.network_config.reserved_nodes.iter().map(|x| &x.multiaddr),
+			&params.network_config.transport,
+		)?;
+		ensure_addresses_consistent_with_transport(
+			params.network_config.public_addresses.iter(),
+			&params.network_config.transport,
+		)?;
+
+		let (to_worker, from_service) = tracing_unbounded("mpsc_network_worker");
+
+		if let Some(path) = params.network_config.net_config_path {
+			fs::create_dir_all(&path)?;
+		}
+
+		// List of multiaddresses that we know in the network.
+		let mut known_addresses = Vec::new();
+		let mut bootnodes = Vec::new();
+		let mut boot_node_ids = HashSet::new();
+
+		// Process the bootnodes.
+		for bootnode in params.network_config.boot_nodes.iter() {
+			bootnodes.push(bootnode.peer_id.clone());
+			boot_node_ids.insert(bootnode.peer_id.clone());
+			known_addresses.push((bootnode.peer_id.clone(), bootnode.multiaddr.clone()));
+		}
+
+		let boot_node_ids = Arc::new(boot_node_ids);
+
+		// Check for duplicate bootnodes.
+		known_addresses.iter()
+			.try_for_each(|(peer_id, addr)|
+				if let Some(other) = known_addresses
+					.iter()
+					.find(|o| o.1 == *addr && o.0 != *peer_id)
+				{
+					Err(Error::DuplicateBootnode {
+						address: addr.clone(),
+						first_id: peer_id.clone(),
+						second_id: other.0.clone(),
+					})
+				} else {
+					Ok(())
+				}
+			)?;
+
+		// Initialize the peers we should always be connected to.
+		let priority_groups = {
+			let mut reserved_nodes = HashSet::new();
+			for reserved in params.network_config.reserved_nodes.iter() {
+				reserved_nodes.insert(reserved.peer_id.clone());
+				known_addresses.push((reserved.peer_id.clone(), reserved.multiaddr.clone()));
+			}
+
+			let print_deprecated_message = match &params.role {
+				Role::Sentry { .. } => true,
+				Role::Authority { sentry_nodes } if !sentry_nodes.is_empty() => true,
+				_ => false,
+			};
+			if print_deprecated_message {
+				log::warn!(
+					"🙇 Sentry nodes are deprecated, and the `--sentry` and  `--sentry-nodes` \
+					CLI options will eventually be removed in a future version. The Substrate \
+					and Polkadot networking protocol require validators to be \
+					publicly-accessible. Please do not block access to your validator nodes. \
+					For details, see https://github.com/paritytech/substrate/issues/6845."
+				);
+			}
+
+			let mut sentries_and_validators = HashSet::new();
+			match &params.role {
+				Role::Sentry { validators } => {
+					for validator in validators {
+						sentries_and_validators.insert(validator.peer_id.clone());
+						reserved_nodes.insert(validator.peer_id.clone());
+						known_addresses.push((validator.peer_id.clone(), validator.multiaddr.clone()));
+					}
+				}
+				Role::Authority { sentry_nodes } => {
+					for sentry_node in sentry_nodes {
+						sentries_and_validators.insert(sentry_node.peer_id.clone());
+						reserved_nodes.insert(sentry_node.peer_id.clone());
+						known_addresses.push((sentry_node.peer_id.clone(), sentry_node.multiaddr.clone()));
+					}
+				}
+				_ => {}
+			}
+
+			vec![
+				("reserved".to_owned(), reserved_nodes),
+				("sentries_and_validators".to_owned(), sentries_and_validators),
+			]
+		};
+
+		let peerset_config = sc_peerset::PeersetConfig {
+			in_peers: params.network_config.in_peers,
+			out_peers: params.network_config.out_peers,
+			bootnodes,
+			reserved_only: params.network_config.non_reserved_mode == NonReservedPeerMode::Deny,
+			priority_groups,
+		};
+
+		// Private and public keys configuration.
+		let local_identity = params.network_config.node_key.clone().into_keypair()?;
+		let local_public = local_identity.public();
+		let local_peer_id = local_public.clone().into_peer_id();
+		let local_peer_id_legacy = bs58::encode(Borrow::<[u8]>::borrow(&local_peer_id)).into_string();
+		info!(
+			target: "sub-libp2p",
+			"🏷  Local node identity is: {} (legacy representation: {})",
+			local_peer_id.to_base58(),
+			local_peer_id_legacy
+		);
+
+		let checker = params.on_demand.as_ref()
+			.map(|od| od.checker().clone())
+			.unwrap_or_else(|| Arc::new(AlwaysBadChecker));
+
+		let num_connected = Arc::new(AtomicUsize::new(0));
+		let is_major_syncing = Arc::new(AtomicBool::new(false));
+		let (protocol, peerset_handle) = Protocol::new(
+			protocol::ProtocolConfig {
+				roles: From::from(&params.role),
+				max_parallel_downloads: params.network_config.max_parallel_downloads,
+			},
+			local_peer_id.clone(),
+			params.chain.clone(),
+			params.transaction_pool,
+			params.finality_proof_request_builder,
+			params.protocol_id.clone(),
+			peerset_config,
+			params.block_announce_validator,
+			params.metrics_registry.as_ref(),
+			boot_node_ids.clone(),
+		)?;
+
+		// Build the swarm.
+		let (mut swarm, bandwidth): (Swarm<B, H>, _) = {
+			let user_agent = format!(
+				"{} ({})",
+				params.network_config.client_version,
+				params.network_config.node_name
+			);
+			let block_requests = {
+				let config = block_requests::Config::new(&params.protocol_id);
+				block_requests::BlockRequests::new(config, params.chain.clone())
+			};
+			let finality_proof_requests = {
+				let config = finality_requests::Config::new(&params.protocol_id);
+				finality_requests::FinalityProofRequests::new(config, params.finality_proof_provider.clone())
+			};
+			let light_client_handler = {
+				let config = light_client_handler::Config::new(&params.protocol_id);
+				light_client_handler::LightClientHandler::new(
+					config,
+					params.chain,
+					checker,
+					peerset_handle.clone(),
+				)
+			};
+
+			let discovery_config = {
+				let mut config = DiscoveryConfig::new(local_public.clone());
+				config.with_user_defined(known_addresses);
+				config.discovery_limit(u64::from(params.network_config.out_peers) + 15);
+				config.add_protocol(params.protocol_id.clone());
+				config.allow_non_globals_in_dht(params.network_config.allow_non_globals_in_dht);
+
+				match params.network_config.transport {
+					TransportConfig::MemoryOnly => {
+						config.with_mdns(false);
+						config.allow_private_ipv4(false);
+					}
+					TransportConfig::Normal { enable_mdns, allow_private_ipv4, .. } => {
+						config.with_mdns(enable_mdns);
+						config.allow_private_ipv4(allow_private_ipv4);
+					}
+				}
+
+				config
+			};
+
+			let mut behaviour = {
+				let result = Behaviour::new(
+					protocol,
+					params.role,
+					user_agent,
+					local_public,
+					block_requests,
+					finality_proof_requests,
+					light_client_handler,
+					discovery_config,
+					params.network_config.request_response_protocols,
+				);
+
+				match result {
+					Ok(b) => b,
+					Err(crate::request_responses::RegisterError::DuplicateProtocol(proto)) => {
+						return Err(Error::DuplicateRequestResponseProtocol {
+							protocol: proto,
+						})
+					},
+				}
+			};
+
+			for (engine_id, protocol_name) in &params.network_config.notifications_protocols {
+				behaviour.register_notifications_protocol(*engine_id, protocol_name.clone());
+			}
+			let (transport, bandwidth) = {
+				let (config_mem, config_wasm, flowctrl) = match params.network_config.transport {
+					TransportConfig::MemoryOnly => (true, None, false),
+					TransportConfig::Normal { wasm_external_transport, use_yamux_flow_control, .. } =>
+						(false, wasm_external_transport, use_yamux_flow_control)
+				};
+				transport::build_transport(local_identity, config_mem, config_wasm, flowctrl)
+			};
+			let mut builder = SwarmBuilder::new(transport, behaviour, local_peer_id.clone())
+				.peer_connection_limit(crate::MAX_CONNECTIONS_PER_PEER)
+				.notify_handler_buffer_size(NonZeroUsize::new(32).expect("32 != 0; qed"))
+				.connection_event_buffer_size(1024);
+			if let Some(spawner) = params.executor {
+				struct SpawnImpl<F>(F);
+				impl<F: Fn(Pin<Box<dyn Future<Output = ()> + Send>>)> Executor for SpawnImpl<F> {
+					fn exec(&self, f: Pin<Box<dyn Future<Output = ()> + Send>>) {
+						(self.0)(f)
+					}
+				}
+				builder = builder.executor(Box::new(SpawnImpl(spawner)));
+			}
+			(builder.build(), bandwidth)
+		};
+
+		// Initialize the metrics.
+		let metrics = match &params.metrics_registry {
+			Some(registry) => {
+				Some(metrics::register(registry, MetricSources {
+					bandwidth: bandwidth.clone(),
+					major_syncing: is_major_syncing.clone(),
+					connected_peers: num_connected.clone(),
+				})?)
+			}
+			None => None
+		};
+
+		// Listen on multiaddresses.
+		for addr in &params.network_config.listen_addresses {
+			if let Err(err) = Swarm::<B, H>::listen_on(&mut swarm, addr.clone()) {
+				warn!(target: "sub-libp2p", "Can't listen on {} because: {:?}", addr, err)
+			}
+		}
+
+		// Add external addresses.
+		for addr in &params.network_config.public_addresses {
+			Swarm::<B, H>::add_external_address(&mut swarm, addr.clone());
+		}
+
+		let external_addresses = Arc::new(Mutex::new(Vec::new()));
+		let peers_notifications_sinks = Arc::new(Mutex::new(HashMap::new()));
+		let protocol_name_by_engine = Mutex::new({
+			params.network_config.notifications_protocols.iter().cloned().collect()
+		});
+
+		let service = Arc::new(NetworkService {
+			bandwidth,
+			external_addresses: external_addresses.clone(),
+			num_connected: num_connected.clone(),
+			is_major_syncing: is_major_syncing.clone(),
+			peerset: peerset_handle,
+			local_peer_id,
+			to_worker,
+			peers_notifications_sinks: peers_notifications_sinks.clone(),
+			protocol_name_by_engine,
+			notifications_sizes_metric:
+				metrics.as_ref().map(|metrics| metrics.notifications_sizes.clone()),
+			_marker: PhantomData,
+		});
+
+		Ok(NetworkWorker {
+			external_addresses,
+			num_connected,
+			is_major_syncing,
+			network_service: swarm,
+			service,
+			import_queue: params.import_queue,
+			from_service,
+			light_client_rqs: params.on_demand.and_then(|od| od.extract_receiver()),
+			event_streams: out_events::OutChannels::new(params.metrics_registry.as_ref())?,
+			peers_notifications_sinks,
+			metrics,
+			boot_node_ids,
+			pending_requests: HashMap::with_capacity(128),
+		})
+	}
+
+	/// High-level network status information.
+	pub fn status(&self) -> NetworkStatus<B> {
+		NetworkStatus {
+			sync_state: self.sync_state(),
+			best_seen_block: self.best_seen_block(),
+			num_sync_peers: self.num_sync_peers(),
+			num_connected_peers: self.num_connected_peers(),
+			num_active_peers: self.num_active_peers(),
+			total_bytes_inbound: self.total_bytes_inbound(),
+			total_bytes_outbound: self.total_bytes_outbound(),
+		}
+	}
+
+	/// Returns the total number of bytes received so far.
+	pub fn total_bytes_inbound(&self) -> u64 {
+		self.service.bandwidth.total_inbound()
+	}
+
+	/// Returns the total number of bytes sent so far.
+	pub fn total_bytes_outbound(&self) -> u64 {
+		self.service.bandwidth.total_outbound()
+	}
+
+	/// Returns the number of peers we're connected to.
+	pub fn num_connected_peers(&self) -> usize {
+		self.network_service.user_protocol().num_connected_peers()
+	}
+
+	/// Returns the number of peers we're connected to and that are being queried.
+	pub fn num_active_peers(&self) -> usize {
+		self.network_service.user_protocol().num_active_peers()
+	}
+
+	/// Current global sync state.
+	pub fn sync_state(&self) -> SyncState {
+		self.network_service.user_protocol().sync_state()
+	}
+
+	/// Target sync block number.
+	pub fn best_seen_block(&self) -> Option<NumberFor<B>> {
+		self.network_service.user_protocol().best_seen_block()
+	}
+
+	/// Number of peers participating in syncing.
+	pub fn num_sync_peers(&self) -> u32 {
+		self.network_service.user_protocol().num_sync_peers()
+	}
+
+	/// Number of blocks in the import queue.
+	pub fn num_queued_blocks(&self) -> u32 {
+		self.network_service.user_protocol().num_queued_blocks()
+	}
+
+	/// Returns the number of downloaded blocks.
+	pub fn num_downloaded_blocks(&self) -> usize {
+		self.network_service.user_protocol().num_downloaded_blocks()
+	}
+
+	/// Number of active sync requests.
+	pub fn num_sync_requests(&self) -> usize {
+		self.network_service.user_protocol().num_sync_requests()
+	}
+
+	/// Adds an address for a node.
+	pub fn add_known_address(&mut self, peer_id: PeerId, addr: Multiaddr) {
+		self.network_service.add_known_address(peer_id, addr);
+	}
+
+	/// Return a `NetworkService` that can be shared through the code base and can be used to
+	/// manipulate the worker.
+	pub fn service(&self) -> &Arc<NetworkService<B, H>> {
+		&self.service
+	}
+
+	/// You must call this when a new block is finalized by the client.
+	pub fn on_block_finalized(&mut self, hash: B::Hash, header: B::Header) {
+		self.network_service.user_protocol_mut().on_block_finalized(hash, &header);
+	}
+
+	/// This should be called when blocks are added to the
+	/// chain by something other than the import queue.
+	/// Currently this is only useful for tests.
+	pub fn update_chain(&mut self) {
+		self.network_service.user_protocol_mut().update_chain();
+	}
+
+	/// Returns the local `PeerId`.
+	pub fn local_peer_id(&self) -> &PeerId {
+		Swarm::<B, H>::local_peer_id(&self.network_service)
+	}
+
+	/// Returns the list of addresses we are listening on.
+	///
+	/// Does **NOT** include a trailing `/p2p/` with our `PeerId`.
+	pub fn listen_addresses(&self) -> impl Iterator<Item = &Multiaddr> {
+		Swarm::<B, H>::listeners(&self.network_service)
+	}
+
+	/// Get network state.
+	///
+	/// **Note**: Use this only for debugging. This API is unstable. There are warnings literally
+	/// everywhere about this. Please don't use this function to retrieve actual information.
+	pub fn network_state(&mut self) -> NetworkState {
+		let swarm = &mut self.network_service;
+		let open = swarm.user_protocol().open_peers().cloned().collect::<Vec<_>>();
+
+		let connected_peers = {
+			let swarm = &mut *swarm;
+			open.iter().filter_map(move |peer_id| {
+				let known_addresses = NetworkBehaviour::addresses_of_peer(&mut **swarm, peer_id)
+					.into_iter().collect();
+
+				let endpoint = if let Some(e) = swarm.node(peer_id).map(|i| i.endpoint()) {
+					e.clone().into()
+				} else {
+					error!(target: "sub-libp2p", "Found state inconsistency between custom protocol \
+						and debug information about {:?}", peer_id);
+					return None
+				};
+
+				Some((peer_id.to_base58(), NetworkStatePeer {
+					endpoint,
+					version_string: swarm.node(peer_id)
+						.and_then(|i| i.client_version().map(|s| s.to_owned())),
+					latest_ping_time: swarm.node(peer_id).and_then(|i| i.latest_ping()),
+					enabled: swarm.user_protocol().is_enabled(&peer_id),
+					open: swarm.user_protocol().is_open(&peer_id),
+					known_addresses,
+				}))
+			}).collect()
+		};
+
+		let not_connected_peers = {
+			let swarm = &mut *swarm;
+			swarm.known_peers().into_iter()
+				.filter(|p| open.iter().all(|n| n != p))
+				.map(move |peer_id| {
+					(peer_id.to_base58(), NetworkStateNotConnectedPeer {
+						version_string: swarm.node(&peer_id)
+							.and_then(|i| i.client_version().map(|s| s.to_owned())),
+						latest_ping_time: swarm.node(&peer_id).and_then(|i| i.latest_ping()),
+						known_addresses: NetworkBehaviour::addresses_of_peer(&mut **swarm, &peer_id)
+							.into_iter().collect(),
+					})
+				})
+				.collect()
+		};
+
+		NetworkState {
+			peer_id: Swarm::<B, H>::local_peer_id(&swarm).to_base58(),
+			listened_addresses: Swarm::<B, H>::listeners(&swarm).cloned().collect(),
+			external_addresses: Swarm::<B, H>::external_addresses(&swarm).cloned().collect(),
+			connected_peers,
+			not_connected_peers,
+			peerset: swarm.user_protocol_mut().peerset_debug_info(),
+		}
+	}
+
+	/// Get currently connected peers.
+	pub fn peers_debug_info(&mut self) -> Vec<(PeerId, PeerInfo<B>)> {
+		self.network_service.user_protocol_mut()
+			.peers_info()
+			.map(|(id, info)| (id.clone(), info.clone()))
+			.collect()
+	}
+
+	/// Removes a `PeerId` from the list of reserved peers.
+	pub fn remove_reserved_peer(&self, peer: PeerId) {
+		self.service.remove_reserved_peer(peer);
+	}
+
+	/// Adds a `PeerId` and its address as reserved. The string should encode the address
+	/// and peer ID of the remote node.
+	pub fn add_reserved_peer(&self, peer: String) -> Result<(), String> {
+		self.service.add_reserved_peer(peer)
+	}
 }
 
 impl<B: BlockT + 'static, H: ExHashT> Future for NetworkWorker<B, H> {
