@@ -611,6 +611,12 @@ dependencies = [
 
 [[package]]
 name = "bs58"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "476e9cd489f9e121e02ffa6014a8ef220ecb15c05ed23fc34cca13925dc283fb"
+
+[[package]]
+name = "bs58"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "771fe0050b883fcc3ea2359b1a96bcfbc090b7116eae7c3c512c7a083fdf23d3"
@@ -3073,7 +3079,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a2d56aadc2c2bf22cd7797f86e56a65b5b3994a0136b65be3106938acae7a26"
 dependencies = [
  "asn1_der",
- "bs58",
+ "bs58 0.4.0",
  "ed25519-dalek",
  "either",
  "fnv",
@@ -3966,6 +3972,7 @@ version = "2.0.0"
 dependencies = [
  "assert_cmd",
  "async-std",
+ "bs58 0.3.1",
  "frame-benchmarking-cli",
  "frame-support",
  "frame-system",
@@ -4185,6 +4192,7 @@ dependencies = [
  "pallet-membership",
  "pallet-mmr",
  "pallet-multisig",
+ "pallet-node-authorization",
  "pallet-offences",
  "pallet-offences-benchmarking",
  "pallet-proxy",
@@ -5542,7 +5550,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2c6805f98667a3828afb2ec2c396a8d610497e8d546f5447188aae47c5a79ec"
 dependencies = [
  "arrayref",
- "bs58",
+ "bs58 0.4.0",
  "byteorder",
  "data-encoding",
  "multihash",
@@ -7464,7 +7472,7 @@ dependencies = [
  "async-trait",
  "asynchronous-codec 0.5.0",
  "bitflags",
- "bs58",
+ "bs58 0.4.0",
  "bytes 1.0.1",
  "cid",
  "derive_more",

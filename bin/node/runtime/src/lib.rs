@@ -1080,6 +1080,22 @@ impl pallet_gilt::Config for Runtime {
 	type WeightInfo = pallet_gilt::weights::SubstrateWeight<Runtime>;
 }
 
+parameter_types! {
+    pub const MaxWellKnownNodes: u32 = 8;
+    pub const MaxPeerIdLength: u32 = 128;
+}
+
+impl pallet_node_authorization::Config for Runtime {
+    type Event = Event;
+    type MaxWellKnownNodes = MaxWellKnownNodes;
+    type MaxPeerIdLength = MaxPeerIdLength;
+    type AddOrigin = EnsureRoot<AccountId>;
+    type RemoveOrigin = EnsureRoot<AccountId>;
+    type SwapOrigin = EnsureRoot<AccountId>;
+    type ResetOrigin = EnsureRoot<AccountId>;
+    type WeightInfo = ();
+}
+
 construct_runtime!(
 	pub enum Runtime where
 		Block = Block,
@@ -1124,6 +1140,7 @@ construct_runtime!(
 		Mmr: pallet_mmr::{Module, Storage},
 		Lottery: pallet_lottery::{Module, Call, Storage, Event<T>},
 		Gilt: pallet_gilt::{Module, Call, Storage, Event<T>, Config},
+		NodeAuthorization: pallet_node_authorization::{Module, Call, Storage, Event<T>, Config<T>},
 	}
 );
 

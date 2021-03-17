@@ -123,5 +123,6 @@ pub fn config_endowed(
 		},
 		pallet_vesting: Default::default(),
 		pallet_gilt: Default::default(),
+		pallet_node_authorization: Default::default(),
 	}
 }

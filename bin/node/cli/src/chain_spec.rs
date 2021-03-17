@@ -25,7 +25,7 @@ use node_runtime::{
 	AuthorityDiscoveryConfig, BabeConfig, BalancesConfig, ContractsConfig, CouncilConfig,
 	DemocracyConfig,GrandpaConfig, ImOnlineConfig, SessionConfig, SessionKeys, StakerStatus,
 	StakingConfig, ElectionsConfig, IndicesConfig, SocietyConfig, SudoConfig, SystemConfig,
-	TechnicalCommitteeConfig, wasm_binary_unwrap,
+	TechnicalCommitteeConfig, wasm_binary_unwrap, NodeAuthorizationConfig,
 };
 use node_runtime::Block;
 use node_runtime::constants::currency::*;
@@ -37,6 +37,7 @@ use sp_consensus_babe::{AuthorityId as BabeId};
 use pallet_im_online::sr25519::{AuthorityId as ImOnlineId};
 use sp_authority_discovery::AuthorityId as AuthorityDiscoveryId;
 use sp_runtime::{Perbill, traits::{Verify, IdentifyAccount}};
+use sp_core::OpaquePeerId; // A struct wraps Vec<u8>, represents as our `PeerId`.
 
 pub use node_primitives::{AccountId, Balance, Signature};
 pub use node_runtime::GenesisConfig;
@@ -328,6 +329,18 @@ pub fn testnet_genesis(
 		},
 		pallet_vesting: Default::default(),
 		pallet_gilt: Default::default(),
+		pallet_node_authorization: NodeAuthorizationConfig {
+			nodes: vec![
+				(
+					OpaquePeerId(bs58::decode("12D3KooWBmAwcd4PJNJvfV89HwE48nwkRmAgo8Vy3uQEyNNHBox2").into_vec().unwrap()),
+					endowed_accounts[0].clone()
+				),
+				(
+					OpaquePeerId(bs58::decode("12D3KooWQYV9dGMFoRzNStwpXztXaBUjtPqi6aU76ZgUriHhKust").into_vec().unwrap()),
+					endowed_accounts[1].clone()
+				),
+			],
+		},
 	}
 }
 
